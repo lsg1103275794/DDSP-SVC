@@ -342,6 +342,12 @@ class CombSubSuperFast(torch.nn.Module):
         super().__init__()
 
         print(' [DDSP Model] Combtooth Subtractive Synthesiser')
+        # Immutable shape/control metadata; retain tensor buffers for old checkpoints
+        # and leave all source-generation floating arithmetic unchanged.
+        geometry = (sampling_rate, block_size, win_length)
+        if any(type(value) is not int or value < 1 for value in geometry):
+            raise ValueError('DDSP geometry must contain positive Python integers')
+        self._geometry = geometry
         # params
         self.register_buffer("sampling_rate", torch.tensor(sampling_rate))
         self.register_buffer("block_size", torch.tensor(block_size))
@@ -365,8 +371,34 @@ class CombSubSuperFast(torch.nn.Module):
                             use_attention=use_attention, 
                             use_pitch_aug=use_pitch_aug)
     
+    @property
+    def sampling_rate_int(self):
+        return self._geometry[0]
+
+    @property
+    def block_size_int(self):
+        return self._geometry[1]
+
+    @property
+    def win_length_int(self):
+        return self._geometry[2]
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        # One load-time CPU read, never a scalar extraction in the forward path.
+        for name, expected in zip(('sampling_rate', 'block_size', 'win_length'),
+                                  self._geometry):
+            key = prefix + name
+            if key in state_dict:
+                value = state_dict[key]
+                if (not isinstance(value, torch.Tensor) or value.numel() != 1
+                        or value.detach().cpu().item() != expected):
+                    error_msgs.append(f'{key}: DDSP geometry mismatch; expected {expected}')
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                     missing_keys, unexpected_keys, error_msgs)
+
     def fast_source_gen(self, f0_frames):
-        n = torch.arange(self.block_size, device=f0_frames.device)
+        n = torch.arange(self.block_size_int, device=f0_frames.device)
         s0 = f0_frames / self.sampling_rate
         ds0 = F.pad(s0[:, 1:, :] - s0[:, :-1, :], (0, 0, 0, 1))
         rad = s0 * (n + 1) + 0.5 * ds0 * n * (n + 1) / self.block_size
@@ -387,11 +419,11 @@ class CombSubSuperFast(torch.nn.Module):
         '''
         # combtooth exciter signal
         combtooth = self.fast_source_gen(f0_frames)
-        combtooth_frames = combtooth.unfold(1, self.block_size, self.block_size)
+        combtooth_frames = combtooth.unfold(1, self.block_size_int, self.block_size_int)
         
         # noise exciter signal
         noise = torch.randn_like(combtooth)
-        noise_frames = noise.unfold(1, self.block_size, self.block_size)
+        noise_frames = noise.unfold(1, self.block_size_int, self.block_size_int)
         
         # parameter prediction
         ctrls, hidden = self.unit2ctrl(units_frames, combtooth_frames, noise_frames, volume_frames, spk_id=spk_id, spk_mix_dict=spk_mix_dict, aug_shift=aug_shift)
@@ -402,15 +434,15 @@ class CombSubSuperFast(torch.nn.Module):
         noise_filter = torch.cat((noise_filter, noise_filter[:,-1:,:]), 1)
         
         # harmonic part filter
-        if combtooth.shape[-1] > self.win_length // 2:
+        if combtooth.shape[-1] > self.win_length_int // 2:
             pad_mode = 'reflect'
         else:
             pad_mode = 'constant'
         combtooth_stft = torch.stft(
                             combtooth,
-                            n_fft = self.win_length,
-                            win_length = self.win_length,
-                            hop_length = self.block_size,
+                            n_fft = self.win_length_int,
+                            win_length = self.win_length_int,
+                            hop_length = self.block_size_int,
                             window = self.window,
                             center = True,
                             return_complex = True,
@@ -419,9 +451,9 @@ class CombSubSuperFast(torch.nn.Module):
         # noise part filter
         noise_stft = torch.stft(
                             noise,
-                            n_fft = self.win_length,
-                            win_length = self.win_length,
-                            hop_length = self.block_size,
+                            n_fft = self.win_length_int,
+                            win_length = self.win_length_int,
+                            hop_length = self.block_size_int,
                             window = self.window,
                             center = True,
                             return_complex = True,
@@ -433,9 +465,9 @@ class CombSubSuperFast(torch.nn.Module):
         # take the istft to resynthesize audio.
         signal = torch.istft(
                         signal_stft,
-                        n_fft = self.win_length,
-                        win_length = self.win_length,
-                        hop_length = self.block_size,
+                        n_fft = self.win_length_int,
+                        win_length = self.win_length_int,
+                        hop_length = self.block_size_int,
                         window = self.window,
                         center = True)
 

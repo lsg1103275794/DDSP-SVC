@@ -50,5 +50,38 @@ class WindowCacheTests(unittest.TestCase):
                 STFT(window_cache_size=size)
 
 
+class GeometryTests(unittest.TestCase):
+    @staticmethod
+    def model(**overrides):
+        from ddsp.vocoder import CombSubSuperFast
+        options = dict(sampling_rate=44100, block_size=32, win_length=128,
+                       n_unit=8, num_layers=1, dim_model=32)
+        options.update(overrides)
+        return CombSubSuperFast(**options)
+
+    def test_integer_metadata_and_legacy_state_keys(self):
+        model = self.model()
+        self.assertEqual((model.sampling_rate_int, model.block_size_int,
+                          model.win_length_int), (44100, 32, 128))
+        self.assertTrue({'sampling_rate', 'block_size', 'win_length', 'window'}
+                        <= model.state_dict().keys())
+        model.load_state_dict(model.state_dict(), strict=True)
+        with self.assertRaises(AttributeError):
+            model.block_size_int = 64
+
+    def test_inconsistent_checkpoint_geometry_fails_even_non_strict(self):
+        for key in ('sampling_rate', 'block_size', 'win_length'):
+            model = self.model()
+            state = model.state_dict()
+            state[key] = state[key] + 1
+            with self.assertRaisesRegex(RuntimeError, 'geometry mismatch'):
+                model.load_state_dict(state, strict=False)
+
+    def test_invalid_configuration_geometry_fails(self):
+        for value in (0, -1, 32.5, True):
+            with self.assertRaises(ValueError):
+                self.model(block_size=value)
+
+
 if __name__ == '__main__':
     unittest.main()
