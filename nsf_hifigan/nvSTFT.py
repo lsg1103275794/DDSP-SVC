@@ -1,4 +1,5 @@
 import math
+from collections import OrderedDict
 import os
 os.environ["LRU_CACHE_CAPACITY"] = "3"
 import random
@@ -57,7 +58,7 @@ def dynamic_range_decompression_torch(x, C=1):
     return torch.exp(x) / C
 
 class STFT():
-    def __init__(self, sr=22050, n_mels=80, n_fft=1024, win_size=1024, hop_length=256, fmin=20, fmax=11025, clip_val=1e-5):
+    def __init__(self, sr=22050, n_mels=80, n_fft=1024, win_size=1024, hop_length=256, fmin=20, fmax=11025, clip_val=1e-5, window_cache_size=64):
         self.target_sr = sr
         
         self.n_mels     = n_mels
@@ -68,7 +69,24 @@ class STFT():
         self.fmax     = fmax
         self.clip_val = clip_val
         self.mel_basis = {}
-        self.hann_window = {}
+        if type(window_cache_size) is not int or window_cache_size < 1:
+            raise ValueError('window_cache_size must be a positive integer')
+        self.window_cache_size = window_cache_size
+        self.hann_window = OrderedDict()
+
+    def _get_hann_window(self, win_size, device):
+        # Preserve baseline CPU construction/default dtype and periodic Hann math.
+        # Pitch itself is not quantized: only the actual window geometry is shared.
+        device = torch.device(device)
+        if device.type == 'cuda' and device.index is None:
+            device = torch.device('cuda', torch.cuda.current_device())
+        key = (win_size, device, torch.get_default_dtype())
+        if key not in self.hann_window:
+            self.hann_window[key] = torch.hann_window(win_size).to(device)
+            if len(self.hann_window) > self.window_cache_size:
+                self.hann_window.popitem(last=False)
+        self.hann_window.move_to_end(key)
+        return self.hann_window[key]
     
     def get_mel(self, y, keyshift=0, speed=1, center=False):
         sampling_rate = self.target_sr
@@ -90,9 +108,7 @@ class STFT():
             mel = librosa_mel_fn(sr=sampling_rate, n_fft=n_fft, n_mels=n_mels, fmin=fmin, fmax=fmax)
             self.mel_basis[mel_basis_key] = torch.from_numpy(mel).float().to(y.device)
         
-        keyshift_key = str(keyshift)+'_'+str(y.device)
-        if keyshift_key not in self.hann_window:
-            self.hann_window[keyshift_key] = torch.hann_window(win_size_new).to(y.device)
+        window = self._get_hann_window(win_size_new, y.device)
         
         pad_left = (win_size_new - hop_length_new) //2
         pad_right = max((win_size_new- hop_length_new + 1) //2, win_size_new - y.size(-1) - pad_left)
@@ -103,7 +119,7 @@ class STFT():
         y = torch.nn.functional.pad(y.unsqueeze(1), (pad_left, pad_right), mode = mode)
         y = y.squeeze(1)
         
-        spec = torch.stft(y, n_fft_new, hop_length=hop_length_new, win_length=win_size_new, window=self.hann_window[keyshift_key],
+        spec = torch.stft(y, n_fft_new, hop_length=hop_length_new, win_length=win_size_new, window=window,
                           center=center, pad_mode='reflect', normalized=False, onesided=True, return_complex=True)                          
         spec = spec.abs()
         if keyshift != 0:
