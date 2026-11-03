@@ -113,5 +113,74 @@ class CheckpointTests(unittest.TestCase):
         self.assertEqual(events, [('load', {'strict': True}), ('to', ('cuda:0',))])
 
 
+class ValidationTests(unittest.TestCase):
+    def test_independent_cadences_keep_legacy_default(self):
+        from reflow.solver import validation_mode_for_step
+        self.assertEqual(validation_mode_for_step({'interval_val': 10}, 10), 'full_audit')
+        options = dict(interval_val=10, validation_mode='loss',
+                       interval_preview=25, interval_audit=100)
+        self.assertIsNone(validation_mode_for_step(options, 1))
+        self.assertEqual(validation_mode_for_step(options, 10), 'loss')
+        self.assertEqual(validation_mode_for_step(options, 25), 'preview')
+        self.assertEqual(validation_mode_for_step(options, 100), 'full_audit')
+
+    def test_isolated_rng_restores_python_numpy_and_torch(self):
+        from reflow.solver import validation_rng_context
+        import random
+        random.seed(42)
+        np.random.seed(42)
+        torch.manual_seed(42)
+        py = random.getstate()
+        np_state = np.random.get_state()
+        state = torch.get_rng_state().clone()
+        with validation_rng_context('cpu', 'isolated', seed=123):
+            random.random()
+            np.random.rand()
+            torch.rand(3)
+        self.assertEqual(random.getstate(), py)
+        self.assertTrue(np.array_equal(np.random.get_state()[1], np_state[1]))
+        self.assertTrue(torch.equal(torch.get_rng_state(), state))
+
+    def test_loss_only_does_not_synthesize_or_log_artifacts(self):
+        from reflow.solver import test
+        from logger.utils import DotDict
+        args = DotDict(dict(device='cpu', train={}, model=dict(t_start=0.0)))
+        model = mock.Mock(return_value=(torch.tensor(1.), torch.tensor(2.)))
+        data = dict(name=['clip'], units=torch.zeros(1, 2, 8),
+                    f0=torch.ones(1, 2, 1), volume=torch.ones(1, 2, 1),
+                    spk_id=torch.ones(1, 1), mel=torch.zeros(1, 2, 128))
+        vocoder, saver = mock.Mock(), mock.Mock()
+        result = test(args, model, vocoder, [data], saver, mode='loss')
+        self.assertEqual(result, (1., 2.))
+        self.assertEqual(model.call_count, 1)
+        vocoder.infer.assert_not_called()
+        saver.log_audio.assert_not_called()
+        saver.log_spec.assert_not_called()
+
+    def test_preview_is_deterministic_subset_and_metrics_are_labeled(self):
+        from reflow.solver import test
+        from logger.utils import DotDict
+        args = DotDict(dict(device='cpu', train=dict(validation_preview_count=1),
+                            model=dict(t_start=0.), infer=dict(infer_step=50, method='euler'),
+                            data=dict(sampling_rate=44100, valid_path='fixture')))
+        rows = [dict(name=[f'clip{i}'], name_ext=[f'clip{i}.wav'],
+                     units=torch.zeros(1, 2, 8), f0=torch.ones(1, 2, 1),
+                     volume=torch.ones(1, 2, 1), spk_id=torch.ones(1, 1),
+                     mel=torch.ones(1, 2, 128)) for i in range(3)]
+        model = mock.Mock(side_effect=lambda *a, **kw: torch.full((1, 2, 128), .5)
+                          if kw['infer'] else (torch.tensor(1.), torch.tensor(2.)))
+        vocoder, saver = mock.Mock(), mock.Mock()
+        vocoder.infer.return_value = torch.ones(1, 1024)
+        with mock.patch('reflow.solver.librosa.load', return_value=(np.ones(1024, dtype=np.float32), 44100)) as load:
+            self.assertEqual(test(args, model, vocoder, rows, saver, mode='preview'), (1., 2.))
+        self.assertEqual(model.call_count, 4)
+        self.assertEqual(vocoder.infer.call_count, 1)
+        self.assertEqual(load.call_count, 1)
+        self.assertEqual(saver.log_spec.call_args.args[0], 'clip0')
+        self.assertTrue(all(key.startswith('validation_preview/')
+                            for call in saver.log_value.call_args_list for key in call.args[0]))
+        self.assertEqual(saver.log_audio.call_args.args[0]['clip0/gt.wav'].device.type, 'cpu')
+
+
 if __name__ == '__main__':
     unittest.main()

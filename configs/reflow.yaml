@@ -48,6 +48,16 @@ train:
   epochs: 100000
   interval_log: 1
   interval_val: 2000
+  # Compatibility defaults: full legacy audit, fp32 and original global RNG consumption.
+  # To reduce routine validation cost: validation_mode: loss, validation_rng: isolated,
+  # interval_preview: 10000, interval_audit: 50000. Preview uses the first N clips.
+  validation_mode: full_audit # loss, preview, full_audit
+  validation_precision: fp32 # explicit; independent from training AMP
+  validation_rng: legacy # legacy, isolated (changing this changes training trajectory)
+  validation_seed: 0
+  validation_preview_count: 2
+  interval_preview: 0 # disabled; independent of interval_val/save cadence
+  interval_audit: 0 # disabled; full-set synthesis and legacy metrics
   interval_force_save: 10000
   lr: 0.0005
   decay_step: 4000
