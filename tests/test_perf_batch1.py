@@ -182,5 +182,113 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(saver.log_audio.call_args.args[0]['clip0/gt.wav'].device.type, 'cpu')
 
 
+class UpdateTests(unittest.TestCase):
+    def test_bf16_has_no_scaler_and_counts_only_finite_updates(self):
+        from reflow.solver import OptimizationStep
+        parameter = torch.nn.Parameter(torch.tensor([1.]))
+        optimizer = torch.optim.SGD([parameter], lr=0.1)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.5)
+        step = OptimizationStep(optimizer, scheduler, 'cpu', torch.bfloat16)
+        self.assertIsNone(step.scaler)
+        parameter.register_hook(lambda gradient: torch.full_like(gradient, float('inf')))
+        self.assertFalse(step.step(parameter.square().sum()))
+        self.assertTrue(torch.equal(parameter, torch.tensor([1.])))
+        self.assertEqual(optimizer.param_groups[0]['lr'], 0.1)
+        self.assertEqual((step.attempted, step.successful, step.skipped), (1, 0, 1))
+
+    def test_finite_step_and_nonfinite_loss_accounting(self):
+        from reflow.solver import OptimizationStep
+        parameter = torch.nn.Parameter(torch.tensor([1.]))
+        optimizer = torch.optim.SGD([parameter], lr=0.1)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.5)
+        step = OptimizationStep(optimizer, scheduler, 'cpu', torch.float32)
+        self.assertTrue(step.step(parameter.square().sum()))
+        self.assertEqual(optimizer.param_groups[0]['lr'], 0.05)
+        snapshot = parameter.detach().clone()
+        optimizer.zero_grad()
+        self.assertFalse(step.step(parameter.sum() * float('inf')))
+        self.assertTrue(torch.equal(parameter, snapshot))
+        self.assertEqual((step.attempted, step.successful, step.skipped), (2, 1, 1))
+
+    def test_chained_optimizer_never_partially_updates_on_overflow(self):
+        from reflow.solver import OptimizationStep
+        from optimizer.chained_optimizer import ChainedOptimizer, OptimizerSpec
+        for dtype in (torch.float32, torch.bfloat16, torch.float16):
+            weight = torch.nn.Parameter(torch.tensor([[1.]]))
+            bias = torch.nn.Parameter(torch.tensor([1.]))
+            optimizer = ChainedOptimizer([weight, bias], [
+                OptimizerSpec(torch.optim.SGD, {}, lambda p: p.ndim == 2),
+                OptimizerSpec(torch.optim.AdamW, {}, None)], lr=0.1)
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=.5)
+            step = OptimizationStep(optimizer, scheduler, 'cpu', dtype)
+            self.assertTrue(step.step(weight.square().sum() + bias.square().sum()))
+            snapshot = [p.detach().clone() for p in (weight, bias)]
+            epoch, lr = scheduler.last_epoch, optimizer.param_groups[0]['lr']
+            optimizer.zero_grad()
+            handle = bias.register_hook(lambda g: torch.full_like(g, float('nan')))
+            self.assertFalse(step.step(weight.square().sum() + bias.square().sum()))
+            handle.remove()
+            self.assertTrue(all(torch.equal(p, s) for p, s in zip((weight, bias), snapshot)))
+            self.assertEqual((scheduler.last_epoch, optimizer.param_groups[0]['lr']), (epoch, lr))
+            self.assertEqual((step.attempted, step.successful, step.skipped), (2, 1, 1))
+
+    def test_fp16_scaler_skips_inf_and_resumes_counter_state(self):
+        from reflow.solver import OptimizationStep
+        parameter = torch.nn.Parameter(torch.tensor([1.]))
+        optimizer = torch.optim.SGD([parameter], lr=0.1)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.5)
+        step = OptimizationStep(optimizer, scheduler, 'cpu', torch.float16)
+        self.assertIsNotNone(step.scaler)
+        parameter.register_hook(lambda gradient: gradient * float('inf'))
+        self.assertFalse(step.step(parameter.square().sum()))
+        self.assertEqual(optimizer.param_groups[0]['lr'], 0.1)
+        state = step.state_dict()
+        replacement = OptimizationStep(optimizer, scheduler, 'cpu', torch.float16)
+        replacement.load_state_dict(state)
+        self.assertEqual(replacement.state_dict(), state)
+
+
+class TrainingControlTests(unittest.TestCase):
+    def test_saver_counter_advances_after_updates_not_attempts(self):
+        from reflow import solver
+        from logger.utils import DotDict
+        parameter = torch.nn.Parameter(torch.tensor([1.]))
+        optimizer = torch.optim.SGD([parameter], lr=.1)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=.5)
+        rows = [dict(units=torch.tensor(float(i))) for i in range(3)]
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.parameter = parameter
+            def forward(self, units, *a, **kw):
+                loss = self.parameter.square().sum()
+                if int(units.item()) == 1:
+                    loss = loss * float('inf')
+                return loss, loss * 0
+
+        class Saver:
+            def __init__(self, *a, **kw): self.global_step=0; self.values=[]
+            def global_step_increment(self): self.global_step+=1
+            def log_info(self, *a): pass
+            def log_value(self, values): self.values.append(values)
+            def get_interval_time(self): return 1
+            def get_total_time(self): return 1
+
+        saver = Saver()
+        for row in rows:
+            row.update(f0=torch.zeros(1), volume=torch.zeros(1), spk_id=torch.ones(1),
+                       aug_shift=torch.zeros(1), mel=torch.zeros(1))
+        args = DotDict(dict(device='cpu', env=dict(expdir='fixture'),
+                            model=dict(t_start=0.), train=dict(amp_dtype='bf16',epochs=1,
+                            lambda_ddsp=1.,interval_log=1,interval_val=100)))
+        with mock.patch.object(solver, 'Saver', return_value=saver):
+            solver.train(args, 0, Model(), optimizer, scheduler, None, rows, [])
+        self.assertEqual(saver.global_step, 2)
+        self.assertEqual(scheduler.last_epoch, 2)
+        self.assertEqual(saver.values[-1]['train/attempted_steps'], 3)
+        self.assertEqual(saver.values[-1]['train/skipped_steps'], 1)
+
+
 if __name__ == '__main__':
     unittest.main()

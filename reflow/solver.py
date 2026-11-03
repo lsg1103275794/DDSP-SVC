@@ -229,6 +229,82 @@ def _test(args, model, vocoder, loader_test, saver, mode):
     return test_ddsp_loss, test_reflow_loss
 
 
+class OptimizationStep:
+    """Finite update gate shared by AMP modes; counters describe this invocation.
+
+    Existing checkpoint global_step remains loadable, but now advances only on
+    successful updates. Old checkpoints cannot reconstruct historical skip counts.
+    Versioned state is available for callers that implement full-state resume.
+    """
+    def __init__(self, optimizer, scheduler, device, dtype):
+        self.optimizer, self.scheduler = optimizer, scheduler
+        self.scaler = GradScaler(torch.device(device).type) if dtype == torch.float16 else None
+        self.attempted = self.successful = self.skipped = 0
+
+    def state_dict(self):
+        return dict(version=1, attempted=self.attempted, successful=self.successful,
+                    skipped=self.skipped,
+                    scaler=self.scaler.state_dict() if self.scaler is not None else None)
+
+    def load_state_dict(self, state):
+        if state.get('version') != 1:
+            raise ValueError('unsupported optimization-step state version')
+        counts = tuple(state[key] for key in ('attempted', 'successful', 'skipped'))
+        if any(type(count) is not int or count < 0 for count in counts) or counts[0] != sum(counts[1:]):
+            raise ValueError('invalid optimization-step counters')
+        if (state['scaler'] is None) != (self.scaler is None):
+            raise ValueError('optimization-step precision differs from saved state')
+        self.attempted, self.successful, self.skipped = counts
+        if self.scaler is not None:
+            self.scaler.load_state_dict(state['scaler'])
+
+    def _finite_gradients(self):
+        groups = {}
+        for group in self.optimizer.param_groups:
+            for parameter in group['params']:
+                if parameter.grad is not None:
+                    grad = parameter.grad.detach()
+                    if grad.is_sparse:
+                        grad = grad.coalesce().values()
+                    if grad.numel():
+                        groups.setdefault((grad.device, grad.dtype), []).append(grad)
+        if not groups:
+            return False
+        # Infinity norm cannot overflow for finite entries (unlike an L2 norm).
+        # One intentional host decision per device/dtype group; retain Inf/NaN safety.
+        return all(bool(torch.isfinite(torch.stack(torch._foreach_norm(grads, float('inf')))).all())
+                   for grads in groups.values())
+
+    def step(self, loss):
+        self.attempted += 1
+        if not bool(torch.isfinite(loss.detach()).all()):
+            self.skipped += 1
+            self.optimizer.zero_grad()
+            return False
+        if self.scaler is None:
+            loss.backward()
+            updated = self._finite_gradients()
+            if updated:
+                self.optimizer.step()
+        else:
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            scale = self.scaler.get_scale()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            # GradScaler lowers its scale exactly when it skips a found-Inf step.
+            # The optimizer's return value (usually None, including ChainedOptimizer)
+            # is not evidence that an update happened.
+            updated = self.scaler.get_scale() >= scale
+        if updated:
+            self.scheduler.step()
+            self.successful += 1
+        else:
+            self.skipped += 1
+            self.optimizer.zero_grad()
+        return updated
+
+
 def train(args, initial_global_step, model, optimizer, scheduler, vocoder, loader_train, loader_test):
     # saver
     saver = Saver(args, initial_global_step=initial_global_step)
@@ -243,7 +319,6 @@ def train(args, initial_global_step, model, optimizer, scheduler, vocoder, loade
     start_epoch = initial_global_step // num_batches
     model.train()
     saver.log_info('======= start training =======')
-    scaler = GradScaler()
     if args.train.amp_dtype == 'fp32':
         dtype = torch.float32
     elif args.train.amp_dtype == 'fp16':
@@ -252,9 +327,9 @@ def train(args, initial_global_step, model, optimizer, scheduler, vocoder, loade
         dtype = torch.bfloat16
     else:
         raise ValueError(' [x] Unknown amp_dtype: ' + args.train.amp_dtype)
+    update = OptimizationStep(optimizer, scheduler, args.device, dtype)
     for epoch in range(start_epoch, args.train.epochs):
         for batch_idx, data in enumerate(loader_train):
-            saver.global_step_increment()
             optimizer.zero_grad()
 
             # unpack data
@@ -267,30 +342,22 @@ def train(args, initial_global_step, model, optimizer, scheduler, vocoder, loade
                 ddsp_loss, reflow_loss = model(data['units'].float(), data['f0'], data['volume'], data['spk_id'], 
                                 aug_shift=data['aug_shift'], vocoder=vocoder, gt_spec=data['mel'].float(), infer=False, t_start=args.model.t_start)
             else:
-                with autocast(device_type=args.device, dtype=dtype):
+                with autocast(device_type=torch.device(args.device).type, dtype=dtype):
                     ddsp_loss, reflow_loss=model(data['units'], data['f0'], data['volume'], data['spk_id'], 
                                     aug_shift=data['aug_shift'], vocoder=vocoder, gt_spec=data['mel'].float(), infer=False, t_start=args.model.t_start)
             
-            # handle nan loss
-            if torch.isnan(ddsp_loss):
-                print(' [x] nan ddsp_loss ')
-                optimizer.zero_grad()
-                del ddsp_loss
-                del reflow_loss
+            loss = args.train.lambda_ddsp * ddsp_loss + reflow_loss
+            # Check components too: a zero lambda must not hide a nonfinite loss.
+            components_finite = bool(torch.isfinite(torch.stack((ddsp_loss.detach(), reflow_loss.detach().to(ddsp_loss.device)))).all())
+            if not components_finite:
+                loss = loss.new_full((), float('nan'))
+            if not update.step(loss):
+                saver.log_value({'train/attempted_steps': update.attempted,
+                                 'train/skipped_steps': update.skipped,
+                                 'train/successful_updates': update.successful})
+                print(f' [x] skipped nonfinite update; attempted={update.attempted}, skipped={update.skipped}')
                 continue
-            elif torch.isnan(reflow_loss):
-                raise ValueError(' [x] nan reflow_loss ')
-            else:
-                loss = args.train.lambda_ddsp * ddsp_loss + reflow_loss
-                # backpropagate
-                if dtype == torch.float32:
-                    loss.backward()
-                    optimizer.step()
-                else:
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
-                scheduler.step()
+            saver.global_step_increment()
                 
             # log loss
             if saver.global_step % args.train.interval_log == 0:
@@ -313,7 +380,10 @@ def train(args, initial_global_step, model, optimizer, scheduler, vocoder, loade
                     'train/loss': loss.item(),
                     'train/ddsp_loss': ddsp_loss.item(),
                     'train/reflow_loss': reflow_loss.item(),
-                    'train/lr': current_lr
+                    'train/lr': current_lr,
+                    'train/attempted_steps': update.attempted,
+                    'train/skipped_steps': update.skipped,
+                    'train/successful_updates': update.successful
                 })
             
             # validation
