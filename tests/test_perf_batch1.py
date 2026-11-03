@@ -83,5 +83,35 @@ class GeometryTests(unittest.TestCase):
                 self.model(block_size=value)
 
 
+class CheckpointTests(unittest.TestCase):
+    def test_checkpoint_policy_is_explicit_and_cpu_staged(self):
+        from logger.checkpoint import load_checkpoint
+        with mock.patch('torch.load', return_value={'model': {}}) as load:
+            load_checkpoint('fixture.pt')
+            self.assertEqual(load.call_args.kwargs,
+                             dict(map_location='cpu', weights_only=False))
+            load_checkpoint('fixture.pt', checkpoint_policy='weights_only')
+            self.assertTrue(load.call_args.kwargs['weights_only'])
+        with self.assertRaises(ValueError):
+            load_checkpoint('fixture.pt', checkpoint_policy='automatic')
+
+    def test_svc_load_is_strict_and_loads_before_device_transfer(self):
+        from reflow import vocoder
+        events = []
+        model = mock.Mock()
+        model.load_state_dict.side_effect = lambda *a, **kw: events.append(('load', kw))
+        model.to.side_effect = lambda *a, **kw: events.append(('to', a))
+        config = dict(vocoder=dict(type='nsf-hifigan', ckpt='fixture'),
+                      model=dict(type='RectifiedFlow'), data={})
+        with mock.patch('builtins.open', mock.mock_open()), \
+             mock.patch.object(vocoder.yaml, 'safe_load', return_value=config), \
+             mock.patch.object(vocoder, 'Vocoder') as voc, \
+             mock.patch.object(vocoder, 'Unit2Wav', return_value=model), \
+             mock.patch.object(vocoder, 'load_checkpoint', return_value={'model': {}}):
+            voc.return_value.dimension = 128
+            vocoder.load_model_vocoder('fixture/model.pt', device='cuda:0')
+        self.assertEqual(events, [('load', {'strict': True}), ('to', ('cuda:0',))])
+
+
 if __name__ == '__main__':
     unittest.main()

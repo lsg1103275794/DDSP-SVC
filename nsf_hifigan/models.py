@@ -1,6 +1,7 @@
 import os
 import json
 from .env import AttrDict
+from logger.checkpoint import load_checkpoint
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -12,16 +13,17 @@ from .utils import init_weights, get_padding
 LRELU_SLOPE = 0.1
 
 
-def load_model(model_path, device='cuda'):
+def load_model(model_path, device='cuda', checkpoint_policy='trusted'):
     h = load_config(model_path)
 
-    generator = Generator(h).to(device)
-
-    cp_dict = torch.load(model_path, map_location=device)
-    generator.load_state_dict(cp_dict['generator'])
-    generator.eval()
-    generator.remove_weight_norm()
+    generator = Generator(h)
+    cp_dict = load_checkpoint(model_path, checkpoint_policy=checkpoint_policy)
+    generator.load_state_dict(cp_dict['generator'], strict=True)
     del cp_dict
+    generator.to(device)
+    generator.eval()
+    # Keep materialization on the target device for baseline numerical identity.
+    generator.remove_weight_norm()
     return generator, h
 
 def load_config(model_path):

@@ -12,6 +12,7 @@ from encoder.hubert.model import HubertSoft
 from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
 from torchaudio.transforms import Resample
 from .unit2control import Unit2Control
+from logger.checkpoint import load_checkpoint
 from .core import frequency_filter, upsample, remove_above_fmax, MaskedAvgPool1d, MedianPool1d
 import time
 
@@ -224,9 +225,10 @@ class Audio2HubertSoft(torch.nn.Module):
         print(' [Encoder Model] HuBERT Soft')
         self.hubert = HubertSoft()
         print(' [Loading] ' + path)
-        checkpoint = torch.load(path)
+        checkpoint = load_checkpoint(path)
         consume_prefix_in_state_dict_if_present(checkpoint, "module.")
-        self.hubert.load_state_dict(checkpoint)
+        self.hubert.load_state_dict(checkpoint, strict=True)
+        del checkpoint
         self.hubert.eval()
      
     def forward(self, 
@@ -242,8 +244,9 @@ class Audio2ContentVec768L12():
         print(' [Encoder Model] Content Vec')
         print(' [Loading] ' + path)
         self.hubert = HubertModelWithFinalProj(HubertConfig())
-        checkpoint = torch.load(path)
-        self.hubert.load_state_dict(checkpoint)
+        checkpoint = load_checkpoint(path)
+        self.hubert.load_state_dict(checkpoint, strict=True)
+        del checkpoint
         self.hubert = self.hubert.to(self.device)
         self.hubert.eval()
 
@@ -260,8 +263,9 @@ class Audio2ContentVec768L12TTA2X():
         print(' [Encoder Model] Content Vec')
         print(' [Loading] ' + path)
         self.hubert = HubertModelWithFinalProj(HubertConfig())
-        checkpoint = torch.load(path)
-        self.hubert.load_state_dict(checkpoint)
+        checkpoint = load_checkpoint(path)
+        self.hubert.load_state_dict(checkpoint, strict=True)
+        del checkpoint
         self.hubert = self.hubert.to(self.device)
         self.hubert.eval()
 
@@ -293,8 +297,9 @@ class CNHubertSoftFish(torch.nn.Module):
         self.proj = torch.nn.Sequential(torch.nn.Dropout(0.1), torch.nn.Linear(768, 256))
         # self.label_embedding = nn.Embedding(128, 256)
 
-        state_dict = torch.load(path, map_location=device)
-        self.load_state_dict(state_dict)
+        state_dict = load_checkpoint(path)
+        self.load_state_dict(state_dict, strict=True)
+        del state_dict
 
     @torch.no_grad()
     def forward(self, audio):

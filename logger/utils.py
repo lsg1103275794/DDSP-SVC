@@ -2,6 +2,7 @@ import os
 import yaml
 import pickle
 import torch
+from .checkpoint import load_checkpoint
 
 def traverse_dir(
         root_dir,
@@ -102,9 +103,10 @@ def load_model(
         else:
             path_pt = path+'best.pt'
         print(' [*] restoring model from', path_pt)
-        ckpt = torch.load(path_pt, map_location=torch.device(device))
+        ckpt = load_checkpoint(path_pt)
         global_step = ckpt['global_step']
         model.load_state_dict(ckpt['model'], strict=False)
         if ckpt.get('optimizer') != None:
             optimizer.load_state_dict(ckpt['optimizer'])
+        del ckpt
     return global_step, model, optimizer

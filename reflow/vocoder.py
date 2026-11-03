@@ -10,6 +10,7 @@ from torchaudio.transforms import Resample
 from .reflow import RectifiedFlow
 from .lynxnet2 import LYNXNet2
 from ddsp.vocoder import CombSubSuperFast
+from logger.checkpoint import load_checkpoint
 
 class DotDict(dict):
     def __getattr__(*args):         
@@ -22,7 +23,8 @@ class DotDict(dict):
 
 def load_model_vocoder(
         model_path,
-        device='cpu'):
+        device='cpu',
+        checkpoint_policy='trusted'):
     config_file = os.path.join(os.path.split(model_path)[0], 'config.yaml')
     with open(config_file, "r") as config:
         args = yaml.safe_load(config)
@@ -52,9 +54,10 @@ def load_model_vocoder(
         raise ValueError(f" [x] Unknown Model: {args.model.type}")
         
     print(' [Loading] ' + model_path)
-    ckpt = torch.load(model_path, map_location=torch.device(device))
+    ckpt = load_checkpoint(model_path, checkpoint_policy=checkpoint_policy)
+    model.load_state_dict(ckpt['model'], strict=True)
+    del ckpt
     model.to(device)
-    model.load_state_dict(ckpt['model'])
     model.eval()
     return model, vocoder, args
 
