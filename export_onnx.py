@@ -36,8 +36,8 @@ class LinearSpectrogram(nn.Module):
         y = torch.nn.functional.pad(
             y.unsqueeze(1),
             (
-                (self.win_length - self.hop_length) // 2,
-                (self.win_length - self.hop_length + 1) // 2,
+                (self.n_fft - self.hop_length) // 2,
+                (self.n_fft - self.hop_length + 1) // 2,
             ),
             mode="reflect",
         ).squeeze(1)

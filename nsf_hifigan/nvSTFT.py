@@ -94,8 +94,8 @@ class STFT():
         if keyshift_key not in self.hann_window:
             self.hann_window[keyshift_key] = torch.hann_window(win_size_new).to(y.device)
         
-        pad_left = (win_size_new - hop_length_new) //2
-        pad_right = max((win_size_new- hop_length_new + 1) //2, win_size_new - y.size(-1) - pad_left)
+        pad_left = (n_fft_new - hop_length_new) //2
+        pad_right = max((n_fft_new - hop_length_new + 1) //2, n_fft_new - y.size(-1) - pad_left)
         if pad_right < y.size(-1):
             mode = 'reflect'
         else:
